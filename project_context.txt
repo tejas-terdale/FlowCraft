@@ -1,0 +1,708 @@
+=====================================================================================================
+PROJECT CONTEXT  -  FlowCraft: Flowchart Image -> Editable draw.io Diagram
+(Hybrid deep-learning + classical computer-vision pipeline)
+=====================================================================================================
+
+PURPOSE OF THIS FILE
+This is a complete, self-contained description of the project, written so that someone who has never seen
+the code can write a project report from it. It covers: the goal, the design decisions and why they were
+made, every algorithm and parameter, the datasets, the training runs, all measured results, the known
+limitations, and how to reproduce everything.
+
+HOW TO READ THE NUMBERS (important for the report)
+Every number below is tagged with where it came from:
+  [VERIFIED]   re-run and confirmed while writing this file (sandbox, CPU).
+  [USER LOG]   taken from the terminal output of the user's own GPU training run (RTX 4050).
+  [README]     taken from the project README, written by an earlier session; where checked, it is marked.
+  [NOT MEASURED] a number that does not exist yet - see section 10 for exactly what to run to get it.
+Nothing in this file is estimated or invented. Where something is unknown, it says so.
+
+-----------------------------------------------------------------------------------------------------
+KEY FACTS AT A GLANCE
+  - Task: flowchart image -> editable .drawio diagram (shapes + text + connected, directed arrows).
+  - Supported: rectangles and diamonds, straight arrows, clean black-on-white images.
+  - Method: YOLOv8n finds/classifies shapes (snapped to exact outlines); Tesseract reads text; classical
+    image processing traces edges and arrow directions; classical detector is the fallback and baseline.
+  - GPU training (RTX 4050): 3,000 train / 300 val synthetic charts, 20 epochs, 640 px, batch 16, about
+    14 minutes; validation precision 1.00, recall 1.00, mAP50 0.995, mAP50-95 0.995.   [USER LOG]
+  - CPU training (shipped earlier model): 299 charts, 8 epochs, 512 px, about 13 minutes; mAP50-95 0.988.
+  - Both demonstration flowcharts are converted exactly: 12/12 shapes, all edges, all directions, all labels,
+    in YOLO mode and in classical mode.   [VERIFIED]
+  - Main synthetic test (60 charts): node F1 1.000, edge connection F1 0.997, directed edge F1 0.951,
+    41/60 charts fully correct; deep learning and classical tie exactly.   [VERIFIED]
+  - A harder synthetic test set: connection F1 only 0.729, because lines touching other than exactly two
+    shapes are dropped - the biggest measured weakness.   [VERIFIED]
+  - Degraded images: shapes and connections stay perfect; OCR label accuracy falls 0.967 -> 0.428 at the
+    severe level.   [VERIFIED]
+  - YOLO mode really runs YOLO and never falls back; Auto mode does fall back (14-check test).   [VERIFIED]
+  - Speed: about 2 s per image on a 2-core CPU (mostly OCR); YOLO inference 2.5 ms/image on the RTX 4050.
+  - NOT measured: the GPU model on a test set; any real-world (non-synthetic) flowcharts.
+
+-----------------------------------------------------------------------------------------------------
+TABLE OF CONTENTS
+  1.  Project summary
+  2.  Scope: what it does and does not do
+  3.  How the project evolved (design history and the problems solved)
+  4.  System architecture (end to end)
+  5.  Detailed algorithms and parameters
+  6.  The deep-learning component (model, data, training, inference)
+  7.  The web application (FlowCraft UI)
+  8.  The draw.io output format
+  9.  Evaluation: metrics, results, verification tests
+  10. What has NOT been measured (and how to measure it)
+  11. Known limitations and failure modes
+  12. Reproducibility: environment, files, commands
+  13. Suggested report outline and talking points
+  14. Future work
+  Appendix A. GPU training log summary          Appendix B. CPU training log summary
+  Appendix C. File inventory                    Appendix D. Glossary
+-----------------------------------------------------------------------------------------------------
+
+
+=====================================================================================================
+1. PROJECT SUMMARY
+=====================================================================================================
+Problem: flowcharts often exist only as pictures (screenshots, exported PNGs). A picture cannot be edited:
+you cannot move a box, fix a label or re-route an arrow. Redrawing by hand is slow.
+
+Solution: a program that takes an image of a flowchart and produces a native, editable diagram file
+(.drawio) in which every box is a separate shape with its text, every connection is a real connector
+attached to its two shapes, and arrows have the right direction. The file opens in the free draw.io
+editor (https://app.diagrams.net) where it can be edited normally; connectors follow shapes when moved.
+
+Approach (one sentence): a trained YOLOv8 neural network finds and classifies the shapes (rectangle or
+diamond), Tesseract OCR reads their text, and classical image processing traces the lines between them
+and decides arrow directions; if the neural network is unavailable the whole thing falls back to a purely
+classical method.
+
+Input assumptions: clean, printed-style flowchart, black lines on a white background, rectangles and
+diamonds joined by straight arrows. NOT handwritten, NOT photographed, NOT heavily degraded.
+
+Deliverables: command-line converter (flow2drawio.py), a web app with three detection modes (app.py),
+a synthetic-data generator (gen_data.py), a training script (train.py), an evaluation script
+(eval_pipeline.py), and two regression/verification test scripts (test_ground_truth.py, test_modes.py).
+
+
+=====================================================================================================
+2. SCOPE
+=====================================================================================================
+SUPPORTED
+  - Shapes: rounded rectangle ("rect") and diamond ("diamond", used for decisions).
+  - Text inside shapes: printed bold sans-serif, read by Tesseract OCR.
+  - Edges: straight lines between exactly two shapes, horizontal, vertical or diagonal.
+  - Arrow direction: detected per edge (arrowhead at one end, the other end, both ends, or none).
+  - Output: .drawio file, original layout and sizes preserved.
+  - Three modes: Auto (YOLO, classical fallback), YOLO only, Classical only.
+
+NOT SUPPORTED (by design, to keep the project simple and reliable)
+  - Ovals / terminators, parallelograms, circles and any other shape class.
+  - Text written on edges (e.g. "Yes" / "No" labels next to a line).
+  - Curved or bent (elbow) lines.
+  - Handwritten, photographed, skewed or very noisy images.
+  - A single line touching more than two shapes (a branch point or merge drawn as one line).
+
+
+=====================================================================================================
+3. HOW THE PROJECT EVOLVED
+=====================================================================================================
+The history matters for the report because it shows engineering decisions backed by measurement.
+
+3.1  Starting requirement
+  The user wanted: upload a black-and-white flowchart image, detect nodes and edges, get an editable
+  diagram. Earlier attempts with off-the-shelf approaches "detected things but not properly".
+  Decision: do not rely on a generic model for the whole task. For clean images, geometry is
+  deterministic, so use classical computer vision first and prove it works.
+
+3.2  Version 1 - classical pipeline (OpenCV + Tesseract)
+  First attempt produced an EMPTY .drawio file when run by the user.
+  Root cause (found by actually running it on the demo image): the box filter required each box's
+  white interior to contain a nested contour for the text. In OpenCV's two-level contour hierarchy
+  (RETR_CCOMP) the letters are top-level contours, not children of the box's hole, so every box was
+  rejected and zero nodes were written.
+  Fix: detect boxes as inner contours (white "holes") of the right size and rectangularity. Result on the
+  first demo image: 12 nodes and 12 edges, correct.
+  Lesson recorded: nothing is "working" until it has been run on the real image and checked against the
+  known answer. This became the project's testing habit (test_ground_truth.py).
+
+3.3  OCR fix
+  5 of 12 labels came back blank. Cause: crops included stray pixels of the box border and the text was
+  small. Fix: crop tightly to the text ink only, rescale to a fixed height, pad with white, and try
+  several Tesseract page-segmentation modes. Result: 12 of 12 labels correct.
+
+3.4  Arrow direction
+  Idea: an arrowhead is a filled triangle, so near the head the line is much "fatter" than its shaft.
+  Measured on the demo images (distance transform, half-width in pixels): shaft 2.0-3.0 px, arrowhead
+  end 5.4-5.8 px, plain end 2.0-3.0 px. First rule (head wider than shaft by +1.5 px) missed two arrows
+  that touch the sharp tip of a diamond: there the head is partly clipped and measured only 3.6 px against
+  a 2.2 px shaft. Replaced with a ratio rule (head wider than 1.3 x shaft; 3.6 / 2.2 = 1.6 passes).
+  Result: all arrows correct on both demo images.
+
+3.5  Diamonds
+  Diamond holes have a bounding-box fill ratio of about 0.5 (a diamond fills half its bounding box) and
+  4 corners. Detection added; shapes are now erased using their true outline mask (not their bounding
+  rectangle), which is what lets lines touching diamond tips be traced correctly.
+  Result: second demo image (4 diamonds, diagonal arrows) correct: 12 nodes, 14 edges, directions right.
+
+3.6  Deep-learning requirement
+  Deep learning became a hard requirement. Decision: hybrid, not a rewrite.
+    - A neural network (YOLOv8n) takes over the question "which shapes exist, where, and what kind".
+    - The tested classical code keeps doing what it is good at: exact outlines, line tracing, arrows.
+    - The classical shape detector is kept as a fallback and as a baseline for comparison.
+  Training data: synthetic flowcharts, generated by a script, with exact labels for free (no manual
+  labelling). A shipped model was trained first on a CPU (8 epochs); the user later trained a stronger
+  one on an RTX 4050 GPU (20 epochs, 3000 charts).
+
+3.7  Making the web app robust
+  On the user's Windows machine the upload page failed with ERR_CONNECTION_RESET (the Python process was
+  crashing). It worked on Linux, so the cause was environment-specific. Most likely cause: PyTorch and
+  OpenCV each load an OpenMP runtime; loading them in the wrong order, or inside a web request / worker
+  thread, can kill the process. Mitigations (all in app.py): set KMP_DUPLICATE_LIB_OK, import torch first
+  at startup, warm the model up before serving, disable Flask's auto-reloader, print any exception.
+  After that the user confirmed the app works in all three modes. Later fix (found by testing, not guessed): the first hardening also made the server single-threaded
+  (threaded=False). That made the page hang on "Converting..." with no POST in the terminal, because a
+  browser's idle spare connection blocks a single-threaded server. This was reproduced (single thread: hung;
+  several threads: served instantly). Final design: threaded=True plus a lock so only one conversion uses the
+  model at a time; verified with four simultaneous uploads in all three modes while idle connections were
+  open. A second, front-end bug followed: after a successful conversion the Convert button stayed disabled
+  ("Converting...") forever, because a downloaded file does not reload the page, so the script that re-enables
+  the button never ran. Reproduced in a real Chromium browser and fixed (see section 7), then verified with 7
+  consecutive conversions across all modes plus an error case. (train.py needed a related
+  Windows fix: wrap training in main() under "if __name__ == '__main__'", because dataloader workers
+  re-import the script on Windows.)
+
+3.8  Verifying the modes really do what they say
+  A test (test_modes.py) spies on the YOLO model and the classical detector and also sabotages YOLO on
+  purpose. See section 9.5.
+
+
+=====================================================================================================
+4. SYSTEM ARCHITECTURE
+=====================================================================================================
+
+   image (PNG/JPG)
+        |
+        v
+  [1] Pre-processing: grayscale + Otsu threshold (inverted) -> binary image "bw" (ink = 255)
+        |
+        v
+  [2] SHAPE DETECTION  (choose by mode)
+        |-- YOLO mode:      YOLOv8n predicts boxes + class (rect/diamond); each box is then snapped to the
+        |                   exact outline found in the pixels (white hole contour) -> shape mask
+        |-- Classical mode: find white holes (inner contours); classify by bounding-box fill ratio and
+        |                   corner count -> shape mask
+        v
+  [3] OCR: for each shape, take only ink inside its own outline, crop tightly, rescale, Tesseract -> label
+        |
+        v
+  [4] EDGE EXTRACTION: erase all shapes (outline + a margin) from "bw"; what remains are lines.
+        Each connected component of remaining ink = one candidate edge. It must touch exactly 2 shapes.
+        |
+        v
+  [5] ARROW DIRECTION: distance transform of each line; the end where the line is > 1.3 x thicker than
+        its shaft carries the arrowhead.
+        |
+        v
+  [6] WRITE .drawio XML: one vertex per shape (rounded rect or rhombus) with label and original geometry;
+        one edge per line with source, target and arrow style.
+
+Mode logic (flow2drawio.convert(src, method)):
+  method = "classical" : never loads or calls YOLO.
+  method = "dl"        : requires the weights file; calls YOLO; NEVER falls back. If YOLO crashes or the
+                         weights are missing it raises an error; if YOLO finds nothing it returns 0 nodes.
+  method = "auto"      : uses YOLO if the weights and the ultralytics package exist; falls back to the
+                         classical detector (and prints a message) if YOLO is missing, crashes, or finds
+                         no shapes.
+Both detectors feed the SAME downstream steps (OCR, edges, arrows, output). Therefore any difference
+between the modes comes purely from shape detection.
+
+
+=====================================================================================================
+5. DETAILED ALGORITHMS AND PARAMETERS  (values as in flow2drawio.py)
+=====================================================================================================
+5.1 Binarisation
+  gray = cvtColor(BGR->GRAY); bw = threshold(gray, 0, 255, THRESH_BINARY_INV | THRESH_OTSU).
+  Otsu picks the threshold automatically; INV makes ink white (255) on black (0).
+
+5.2 Classical shape detector  (_classical_shapes)
+  - cv2.findContours(bw, RETR_CCOMP): returns outer contours and holes. Only HOLES are kept
+    (hierarchy parent != -1): the white interior of a drawn box is a hole in the ink.
+  - Size filter: area between 0.05 % and 25 % of the image area, width >= 40 px, height >= 25 px.
+  - Rectangle: contour area / bounding-box area >= 0.90.
+  - Diamond: ratio between 0.40 and 0.60 AND approxPolyDP (epsilon = 2 % of perimeter) has exactly 4
+    vertices.
+  - Anything else is ignored (for example the empty region enclosed by a loop of arrows).
+  - Must contain >= 30 ink pixels (text); an empty enclosed gap is not a shape.
+  - Shapes are sorted top-to-bottom in bands of 60 px, then left-to-right (stable, readable order).
+
+5.3 OCR  (_ocr)
+  - Only ink inside the shape's own mask, eroded by a 7x7 kernel (removes the border pixels), counts.
+  - Crop to the tight bounding box of that ink; invert to black text on white.
+  - Resize to a target text height of 60 px (then 40, then 90 if the first fails), pad 30 px of white.
+  - pytesseract.image_to_string with page-segmentation modes 7 (single line), 6 (block), 8 (single word),
+    in that order; first non-empty result wins. Characters outside letters, digits, spaces and - / & ( ) . , : ? !
+    are stripped. If everything fails the label is "?".
+
+5.4 Edge extraction
+  - Each shape mask is dilated by a square kernel of radius 6 px (8 px for diamonds, whose sharp tips need a
+    little extra) and erased from bw. That removes outline + anti-aliasing but leaves arrowheads that touch
+    the shape.
+  - cv2.connectedComponentsWithStats (8-connectivity) on what is left; components smaller than 30 px are noise.
+  - A component is an edge only if it comes within (erase radius + 12 px) of EXACTLY two shapes.
+    Components touching 0, 1, 3 or more shapes are skipped and a message is printed
+    ("skipped a line touching N shapes"). This is the main source of missed edges (see section 11).
+
+5.5 Arrow direction
+  - dt = distanceTransform(component): value at each ink pixel = distance to the nearest background pixel
+    (about half the local line thickness).
+  - base = maximum dt in the middle part of the line (the part beyond the neighbourhood of both
+    shapes, roughly more than 30 px from either).
+  - For each end: w_end = maximum dt within that shape's neighbourhood.
+  - Arrowhead at an end if w_end > 1.3 x base. If the line is so short that no middle part exists, compare
+    the two ends to each other (ratio 1.4).
+  - The result is (arrow_at_a, arrow_at_b). Exactly one -> directed edge towards that end. Both -> double
+    headed edge. None -> plain undirected line.
+
+5.6 Ordering and ids
+  Shapes get ids n0..nN in sorted order; edges e0..eM.
+
+5.7 YOLO shape detector  (_dl_shapes)
+  - model.predict(image, imgsz = the size the model was trained at, conf = 0.4, iou = 0.5 for NMS).
+  - Each predicted box (class 0 = rect, 1 = diamond) is matched to the white-hole contour with the
+    highest overlap (IoU computed against the hole's bounding box grown by 4 px). If IoU >= 0.7 the
+    contour is used as the exact shape mask (pixel-accurate outline). Otherwise the network's box,
+    inset by 4 px, is used as the mask (rectangle, or a diamond polygon through the box edge midpoints).
+  - Why snap: edge tracing needs the outline to the pixel; the network box is accurate to a few pixels,
+    which would leave pieces of the border behind or cut into arrowheads.
+  - So the division of labour is: YOLO decides WHAT exists and what KIND; classical geometry refines WHERE.
+
+
+=====================================================================================================
+6. THE DEEP-LEARNING COMPONENT
+=====================================================================================================
+6.1 Model
+  YOLOv8n ("nano") from Ultralytics, initialised from COCO-pretrained weights (yolov8n.pt), head
+  re-initialised for 2 classes (349 of 355 weight tensors transferred).  [USER LOG]
+  129 layers, 3,011,238 parameters, 8.2 GFLOPs.  [USER LOG]   File size about 6.5 MB.
+  Classes: 0 = rect, 1 = diamond.
+  Task: object detection (bounding boxes + class).
+
+6.2 Why synthetic data
+  Hand-labelling hundreds of flowcharts is slow. Flowcharts are easy to draw with a script, and a script
+  knows the exact position, type, text and connections of everything it draws, so labels are perfect and
+  unlimited. The generator writes three things per image: the picture, YOLO labels (class x y w h
+  normalised), and a ground-truth graph (nodes with kind, label, bounding box; directed edges) used by
+  the evaluation script.
+
+6.3 Datasets (three exist - do not mix them up in the report)
+  (a) "data/" in the earlier working copy  [VERIFIED]:  800 train / 100 val / 60 test charts.
+        train: 9,053 shapes (6,399 rect, 2,654 diamond), 11,943 edges, 11.3 shapes per chart.
+        val:   1,130 shapes (798 rect, 332 diamond), 1,542 edges.
+        test:  608 shapes (449 rect, 159 diamond), 813 edges, 10.1 shapes per chart.
+        Image sizes: width 1,601-2,400 px, height 895-1,782 px.
+        Produced by an earlier generator whose source file was later overwritten (see 6.4 note).
+  (b) "data2/" in the earlier working copy  [VERIFIED]: same split sizes (800/100/60), generated
+        separately: its 60 test images are all different from (a)'s test images (0 of 60 identical).
+        The shipped CPU model was trained on a 299-chart subset of its train split, validated on its
+        100 val charts (1,130 shapes). [README + run settings]
+  (c) The user's GPU dataset  [USER LOG]: 3,000 train and 300 val images generated on the user's machine by
+        the current gen_data.py. Validation contains 2,626 shapes: 1,885 rect (in 294 images) and 741
+        diamond (in 251 images), i.e. about 72 % rect / 28 % diamond. About 8.8 shapes per chart.
+        A test split size is not shown in the log.  [NOT MEASURED on the GPU model: see section 10]
+
+6.4 The data generator (gen_data.py, current version)
+  IMPORTANT PROVENANCE NOTE: the first generator (which produced datasets (a) and (b)) was accidentally
+  overwritten during the project and could not be recovered. gen_data.py is a faithful RECONSTRUCTION of its
+  interface and file layout (it works with eval_pipeline.py), but it is NOT the same program and its charts
+  are simpler (see below). The report should say "synthetic data generated by a script" and describe the
+  generator in the way given here, not claim the old one.
+  Current generator:
+    - Canvas 2000/2200/2400 px wide x 1300/1400/1600 px high, white, black drawing, bold DejaVu Sans labels.
+    - A grid of 3-5 columns x 3-4 rows; each cell is occupied with probability 0.60-0.90.
+    - Occupied cells become a diamond with probability 0.15-0.40, otherwise a rounded rectangle.
+    - Rectangle width = min(400, 0.62 x cell width) x (0.9-1.0), height = min(110, 0.38 x cell height);
+      diamond height = min(190, 0.55 x cell height). Label font shrinks until the text fits.
+    - Labels drawn without repetition from 40 rectangle phrases ("Start", "Load Data", "Validate", ...) and
+      14 diamond phrases ("Data OK?", "Quality Pass?", "Archive?", ...).
+    - Edges join horizontally or vertically ADJACENT cells with probability 0.65 each, random direction;
+      lines run centre-to-centre clipped at the outlines; stroke width 3-5 px; filled triangular
+      arrowhead 16-24 px long, 6-9 px half-width. Shapes with no edge are dropped.
+    - Outputs: images/<split>/, labels/<split>/ (YOLO txt), gt/<split>/ (JSON with width, height, nodes[id,
+      label, kind, bbox], edges[src, dst]), data.yaml. The script refuses to write into a non-empty folder.
+    - Consequence: every edge is axis-aligned between neighbours, so these charts are EASIER than the
+      earlier datasets (no diagonal edges, no lines passing near a third shape). On 12 charts from this
+      generator both pipelines scored perfectly (section 9.3).
+
+6.5 Training runs
+  RUN 1 - shipped CPU model  [README + run settings + VERIFIED log/results.csv]
+     Hardware: Intel Xeon 2.10 GHz, CPU only (PyTorch 2.14.1, Ultralytics 8.4.175).
+     Data: dataset (b) train subset, 299 charts; validation: its 100 val charts.
+     Settings: yolov8n.pt pretrained, 8 epochs, image size 512, batch 8, mosaic 0.5, scale 0.3,
+               no flips, no hue/saturation jitter, no rotation.
+     Time: 0.224 h (about 13 minutes).
+     Final validation (epoch 8): precision 1.00, recall 1.00, mAP50 0.995, mAP50-95 0.988.
+  RUN 2 - user's GPU model  [USER LOG]
+     Command: python train.py --epochs 20 --imgsz 640 --batch 16   (data = data/data.yaml, 3000 train, 300 val)
+     Hardware: NVIDIA GeForce RTX 4050 Laptop GPU, 6,140 MiB; Windows; Python 3.13.9, PyTorch 2.6.0+cu124,
+               Ultralytics 8.4.175.
+     Settings: yolov8n.pt pretrained, 20 epochs, image size 640, batch 16, AdamW (chosen automatically,
+               lr 0.001667), amp=False (full precision), mosaic 0.5 (switched off for the last 10 epochs by
+               the default "close_mosaic"), scale 0.3, no flips, no hue/saturation jitter, no rotation,
+               patience 20, 2 dataloader workers.
+     Speed: about 37-46 s per epoch (188 iterations at about 5 it/s); GPU memory 3.3-4.0 GB;
+            total 0.231 h (about 14 minutes).
+     Final validation (300 charts, 2,626 shapes), best checkpoint:
+            all     P 1.00  R 1.00  mAP50 0.995  mAP50-95 0.995
+            rect    P 1.00  R 1.00  mAP50 0.995  mAP50-95 0.995  (1,885 shapes)
+            diamond P 1.00  R 1.00  mAP50 0.995  mAP50-95 0.995  (741 shapes)
+     Inference speed on that GPU: 0.2 ms pre-process + 2.5 ms inference + 1.4 ms post-process per image.
+     Selected model saved to models/shape_detector.pt (the previous one is copied to
+     models/shape_detector.prev.pt by train.py).
+  How to read these results honestly:
+     - mAP50 0.995 appears to be the practical ceiling of this metric implementation: it is what a class with
+       every object found shows. The GPU run reaches mAP50-95 0.995 from epoch 7 onward, so the validation set
+       cannot tell later epochs apart; it is saturated.
+     - Validation charts come from the same generator as the training charts, and the best checkpoint is
+       chosen on them. This measures "can the network learn this synthetic distribution" (yes, easily), not
+       "does it work on any flowchart".
+     - The shape-detection task is visually simple (high-contrast, clean, two classes), which is why a
+       3-million-parameter model reaches the ceiling in a handful of epochs.
+
+6.6 Inference notes
+  Image size used at inference = the size the model was trained at (read from the model file): 512 for
+  the CPU model, 640 for the GPU model. Switching models needs no code change: the converter loads
+  models/shape_detector.pt (or the file named in the environment variable FLOWCHART_MODEL). The device used
+  at inference (CPU or GPU) is chosen automatically by PyTorch and is independent of where the model was
+  trained.
+  Speed: YOLO inference is a few milliseconds on the GPU. A whole conversion takes about 2 s per image on a
+  2-core CPU sandbox, dominated by Tesseract OCR and contour processing, not by the neural network.
+
+
+=====================================================================================================
+7. THE WEB APPLICATION  (app.py, branded "FlowCraft")
+=====================================================================================================
+  Stack: Flask (Python) serving one page; runs locally at http://127.0.0.1:5000 ("Local Processing"
+  badge: images never leave the computer).
+  User flow: drop or browse for an image (PNG/JPG/JPEG/WEBP, client-side type check, file name and size
+  shown, remove button) -> choose a detection method -> "Convert to Diagram" -> a file diagram.drawio is
+  downloaded -> open it in draw.io (File > Open).
+  Detection method (radio buttons): "Auto Detect" (YOLO with classical fallback; marked RECOMMENDED, default),
+  "YOLO" (deep learning only), "Classical" (traditional computer vision only). These map to the
+  convert() modes auto / dl / classical.
+  Right-hand panel: static illustration and three feature tiles (Editable, Connected, Exportable). There is
+  no in-page preview of the result.
+  Errors: any exception is printed with a traceback in the terminal and shown on the page in a
+  "Conversion notice" box; "No boxes found in this image." if zero shapes are detected.
+  Startup: the app runs one conversion of flowchart2.png as a warm-up (loads the model once, in the main
+  thread) and prints "warm-up OK (detector: dl)". Flask runs with debug=False (no auto-reloader) and
+  threaded=True; a lock (CONVERT_LOCK) lets only one conversion use the model at a time, so concurrent
+  requests queue instead of hanging the server.
+  Download handling: the result is sent as a file download, which does not reload the page. The page therefore
+  puts a random token in the form, disables the button while converting, and polls for a cookie named dl_done
+  that the server sets (with that token) on the download response; when it appears the button is re-enabled
+  (5-minute safety timeout; also reset when the browser restores the page from its back/forward cache). On an
+  error the server returns a normal page, which reloads with a working button. This allows any number of
+  conversions without restarting the server or refreshing.
+  The UI (HTML/CSS/JS) was redesigned by the user; the conversion logic is unchanged.
+
+
+=====================================================================================================
+8. THE DRAW.IO OUTPUT FORMAT
+=====================================================================================================
+  A .drawio file is XML:  <mxfile><diagram><mxGraphModel><root> ... </root></mxGraphModel></diagram></mxfile>
+  Cells: id "0" and "1" are the mandatory root layers. Then:
+    - each shape:  <mxCell id="n3" value="Load Data" style="rounded=1;whiteSpace=wrap;html=1;fontStyle=1;
+      fontSize=18;strokeWidth=3;" vertex="1" parent="1"><mxGeometry x y width height as="geometry"/></mxCell>
+      (diamonds use style "rhombus;..."). Geometry is the detected outline, grown by 2 px (rectangles) or
+      by 2/sin(angle) (diamonds) to compensate for the inset of the detected hole inside the stroke.
+    - each edge:   <mxCell id="e5" style="endArrow=block;startArrow=none;html=1;strokeWidth=3;" edge="1"
+      parent="1" source="n3" target="n7"><mxGeometry relative="1" as="geometry"/></mxCell>
+      source/target are the shape ids, so the connector stays attached when shapes are moved.
+      Arrow style: endArrow=block for a head at the target, startArrow=block for a head at the source
+      (both for double-headed), "none" otherwise. No waypoints are stored: draw.io draws a straight
+      connector between the two shapes, like the original.
+  Page size is set to image size + 200 px so nothing falls outside the page.
+  The XML is validated (parsed) in the test scripts.
+
+
+=====================================================================================================
+9. EVALUATION
+=====================================================================================================
+9.1 Metrics (eval_pipeline.py)
+  Ground truth comes from the generator (exact boxes, kinds, labels, directed edges).
+  - Shape matching: each predicted shape is matched to a ground-truth shape greedily by IoU > 0.5
+    (predicted hole box grown by 4 px to approximate the outer stroke).
+  - Node F1: precision/recall of matched shapes whose class (rect/diamond) is also correct.
+  - Label accuracy: matched shapes whose OCR text equals the true text after lower-casing and removing
+    punctuation (letters, digits and "?" kept).
+  - Edge F1 (directed): an edge counts only if both ends match the right shapes AND the direction is right.
+  - Edge F1 (connection): same but ignoring direction.
+  - Perfect charts: all shapes found with right class, no extra shapes, edge set identical to ground truth.
+  - sec/img: wall-clock seconds for a whole conversion (2-core CPU sandbox, includes OCR).
+  F1 = 2PR/(P+R).
+
+9.2 Main result: clean synthetic test set (60 charts)  [VERIFIED - re-run for this document]
+  Test set = data2/test (dataset (b)), the one the README table came from; the numbers reproduce the README
+  exactly, which is why they can be trusted. Model = the shipped CPU model.
+
+  method        node F1  label acc  edge F1 (dir)  edge F1 (conn)  perfect charts  sec/img
+  classical      1.000     0.997        0.951          0.997          41/60          2.00
+  deep learning  1.000     0.997        0.951          0.997          41/60          1.99
+
+  Reading: shapes are found essentially perfectly by both. Connections are found almost perfectly (0.997);
+  the gap to 0.951 is direction errors (about 4.6 points). 41 of 60 charts are completely correct; the
+  other 19 contain at least one wrong or missing edge, or an extra or missed shape (label errors are not
+  part of this count).
+
+9.3 Same pipeline on the OTHER synthetic test sets  [VERIFIED]
+  (i) data/test (dataset (a)), 60 charts, shipped CPU model:
+  method        node F1  label acc  edge F1 (dir)  edge F1 (conn)  perfect charts  sec/img
+  classical      0.998     1.000        0.706          0.729           7/60          1.98
+  deep learning  0.992     1.000        0.706          0.730           8/60          2.16
+  Reading: shape detection is again near perfect, but only about 73 % of connections are recovered. The
+  program log shows many "skipped a line touching 3, 4, 5 (even 8) shapes" messages: on these charts many
+  lines touch, cross or run very close to a third shape, so the "exactly two shapes" rule discards them.
+  This is the clearest measured weakness of the edge-tracing stage and it is independent of which shape
+  detector is used. (Both test sets are synthetic; (a) is evidently harder than (b).)
+  (ii) 12 charts from the current gen_data.py, seed 7 (small sample), shipped CPU model:
+  classical 1.000 / 1.000 / 1.000 / 1.000, 12/12 perfect;  deep learning identical, 12/12.
+  These charts only contain axis-aligned neighbour edges, so this confirms the pipeline is correct
+  on the simple case but is not a strong test.
+  (iii) The user's GPU model on its own test split: [NOT MEASURED] - see section 10.
+
+9.4 The two demonstration images (real hand-checked ground truth)  [VERIFIED]
+  Image 1 ("flowchart.png"): 12 rectangles, 12 directed edges, includes a loop back. Both modes: 12/12
+  nodes, all 12 edges with correct direction, all labels correct.
+  Image 2 ("flowchart2.png"): 8 rectangles + 4 diamonds, 14 directed edges, diagonal arrows. Both modes:
+  12/12 nodes, 4/4 diamonds, all 14 edges with correct direction, all labels correct.
+  (test_ground_truth.py runs both images in both modes and prints PASS/FAIL.)
+
+9.4A Robustness to degraded images  [VERIFIED - re-run for this document]
+  eval_pipeline.py can degrade each test image before conversion: Gaussian blur (sigma 1.2 / 2.0 px),
+  additive Gaussian noise (sigma 10 / 22 grey levels) and JPEG compression (quality 35 / 15) for level 1
+  (moderate) / level 2 (severe). Run on the FIRST 30 charts of data2/test with the shipped CPU model, so
+  these rows are not directly comparable with the 60-chart table in 9.2.
+
+  level 1 (moderate)
+  method        node F1  label acc  edge F1 (dir)  edge F1 (conn)  perfect charts  sec/img
+  classical      1.000     0.967        0.934          1.000          19/30          1.99
+  deep learning  1.000     0.967        0.934          1.000          19/30          2.18
+  level 2 (severe)
+  method        node F1  label acc  edge F1 (dir)  edge F1 (conn)  perfect charts  sec/img
+  classical      1.000     0.428        0.931          1.000          16/30          2.42
+  deep learning  1.000     0.428        0.931          1.000          16/30          2.49
+
+  Reading: shape detection and connection recovery are unaffected even by severe degradation (node F1 and
+  connection F1 stay at 1.000; directed F1 stays about 0.93, close to the clean value). The part that breaks
+  is text recognition: label accuracy falls from 0.967 (moderate) to 0.428 (severe). So the limit of the
+  system on poor images is the OCR stage (Tesseract), not the shape detector. The network and the classical
+  rules again tie exactly. Caveat: the degradation is applied to clean synthetic images; it is not the same
+  as real photographs or screenshots from other tools.
+
+9.5 Verification that the modes do what they claim  [VERIFIED - test_modes.py, 14 checks, all pass]
+  Method: the script wraps the YOLO model's predict() and the classical detector in call counters, and
+  tampers with YOLO's output on purpose.
+    - Classical mode: YOLO called 0 times; classical detector called once.
+    - YOLO mode: YOLO called once; classical SHAPE detector called 0 times; node count same as classical (12).
+    - YOLO forced to return only 3 boxes: YOLO mode returns exactly 3 nodes (classical alone gives 12) =>
+      the network's output really decides which shapes exist.
+    - YOLO forced to return nothing: YOLO mode returns 0 nodes with no fallback; Auto falls back (12 nodes).
+    - YOLO forced to crash: YOLO mode raises an error (no fallback); Auto falls back.
+    - Weights file missing: YOLO mode raises an error; Auto falls back.
+  Note: even in YOLO mode, classical contour code still (a) snaps boxes to outlines and (b) does the line
+  and arrow tracing. The claim "YOLO detects the shapes" is accurate; "the whole pipeline is deep learning"
+  would not be.
+
+9.6 Honest comparison of the two approaches
+  On clean synthetic charts the trained network and the hand-written rules tie on every metric (9.2, 9.3).
+  That is expected: for clean rectangles and diamonds the geometry rules are already near perfect. The
+  justifiable advantages of the learned detector are: (1) extensibility - a new shape (oval, parallelogram)
+  needs new generated data and retraining, not new hand-tuned geometry rules; (2) it classifies by
+  learned appearance rather than thresholds such as "fill ratio 0.4-0.6"; (3) it is a trainable component
+  that can be improved with data. Do not claim it is more accurate than the classical method on clean
+  charts; the measurements show it is equal.
+
+
+=====================================================================================================
+10. WHAT HAS NOT BEEN MEASURED (and exactly how to measure it)
+=====================================================================================================
+  1. Test-set metrics for the user's GPU model (trained on 3,000 charts from the current generator).
+     The training log gives validation numbers only. To get the full pipeline comparison on the user's
+     machine, from the project folder:
+         python eval_pipeline.py --data data --method both
+     (uses data/images/test and data/gt/test; that split exists only if gen_data.py was run with
+     --test N, whose default is 100). Add  --perturb 1  or  --perturb 2  for degraded images.
+     Expect near-perfect scores on this generator's charts because they are axis-aligned and simple; to
+     reproduce the harder behaviour of section 9.3 a dataset with diagonal / crossing edges is needed.
+  2. Real-world flowcharts (screenshots from other tools, photos, scans): not tested beyond the two
+     demonstration images.
+  3. Direction errors: the exact cause of the ~5 % wrong directions on dataset (b) has not been analysed
+     chart by chart (likely arrowheads partly hidden by shape outlines or overlapping lines).
+  4. A learned arrow-direction or edge model: not attempted.
+
+
+=====================================================================================================
+11. KNOWN LIMITATIONS AND FAILURE MODES
+=====================================================================================================
+  1. Lines touching other than exactly two shapes are dropped (measured: edge connection F1 0.729 on the
+     harder test set). A branch drawn as one line from one box to several boxes would be missed.
+  2. Arrow direction is wrong on about 5 % of edges on dataset (b) (directed F1 0.951 vs connection 0.997).
+  3. Only two shape classes. Ovals/terminators, parallelograms, circles etc. are not detected, so such
+     flowcharts will lose shapes (and therefore the edges attached to them).
+  4. No text on edges; text outside shapes is ignored (and may confuse edge tracing if it touches a line).
+  5. Straight edges only. Curved or elbow lines may be traced as connections but are redrawn as straight
+     connectors; elbow lines in particular are untested.
+  6. OCR depends on Tesseract and clean bold printed text; degraded images mostly hurt this stage.
+  7. Clean, high-contrast, white-background images only (no handwriting, photos, shadows).
+  8. Training and test data are synthetic and from one visual style; generalisation to other drawing tools is
+     unproven.
+  9. The shipped model is a very short training run; metrics are saturated so they cannot rank models.
+ 10. Processing time is about 2 s per image on a 2-core CPU, mostly OCR.
+ 11. The web app has no result preview and no edit mode; editing is done in draw.io.
+
+
+=====================================================================================================
+12. REPRODUCIBILITY
+=====================================================================================================
+12.1 Software
+  Verification environment (sandbox, CPU): Python 3.13.16, OpenCV 5.0.0, NumPy 2.5.3, pytesseract 0.3.13,
+    Tesseract 5.3.4, Flask 3.1.3, Pillow 12.3.0, PyTorch 2.14.1, Ultralytics 8.4.175.
+  User's training machine: Windows, Python 3.13.9, PyTorch 2.6.0+cu124, Ultralytics 8.4.175,
+    NVIDIA GeForce RTX 4050 Laptop GPU (6 GB).
+  requirements.txt: opencv-python, numpy, pytesseract, flask, ultralytics, pillow, torch.
+  Tesseract OCR itself must be installed separately (Windows: winget install UB-Mannheim.TesseractOCR;
+  macOS: brew install tesseract; Linux: sudo apt install tesseract-ocr). On Windows install the CUDA build of
+  PyTorch from pytorch.org before ultralytics, otherwise training silently runs on the CPU.
+
+12.2 Commands
+  Run the web app:            python app.py            -> http://127.0.0.1:5000
+  Convert from the terminal:  python flow2drawio.py flowchart2.png out.drawio --method auto|dl|classical
+  Generate data:              python gen_data.py --out data --train 3000 --val 300 --test 100
+  Train:                      python train.py --epochs 20 --imgsz 640 --batch 16
+                              (defaults: --data data/data.yaml --epochs 60 --imgsz 960 --batch 8;
+                               lower --batch if CUDA runs out of memory)
+  Evaluate:                   python eval_pipeline.py --method both [--data data] [--perturb 1|2] [--limit N]
+  Regression test:            python test_ground_truth.py    (both demo images, both modes)
+  Mode verification:          python test_modes.py
+  Switch models:              put the wanted .pt at models/shape_detector.pt (restart the app), or set the
+                              environment variable FLOWCHART_MODEL to its path.
+
+12.3 Caveat on randomness
+  Generation is seeded (--seed, default 0) so datasets are reproducible; training uses seed 0 and
+  deterministic mode, but GPU results can still differ slightly between machines and library versions.
+
+
+=====================================================================================================
+13. SUGGESTED REPORT OUTLINE AND TALKING POINTS
+=====================================================================================================
+  1. Introduction / problem (section 1)             2. Objectives and scope (section 2)
+  3. Literature or related work (not covered here: friends should add - e.g. object detection with YOLO,
+     diagram recognition, OCR with Tesseract; this file contains no citations)
+  4. Methodology: pipeline (4, 5), model and data (6), output format (8)
+  5. Implementation: web app (7), tooling and testing habits (3, 9.4, 9.5)
+  6. Experiments and results (6.5, 9)               7. Discussion and limitations (9.6, 11)
+  8. Conclusion and future work (14)                Appendices (A-D)
+
+  CLAIMS THE EVIDENCE SUPPORTS
+   - A trained YOLOv8n detects and classifies rectangles and diamonds in clean synthetic flowcharts with
+     validation precision/recall 1.00 and mAP50 0.995 (CPU run: mAP50-95 0.988; GPU run: 0.995).
+   - The hybrid pipeline reproduces both demonstration flowcharts exactly: all shapes, labels, connections
+     and arrow directions.
+   - Deep-learning mode really runs the network and does not silently fall back (test_modes.py).
+   - Auto mode falls back to the classical detector when the network is missing, crashes or finds nothing.
+   - On the main synthetic test set, edge connections are recovered at F1 0.997 and directed edges at 0.951.
+   - Training on a laptop GPU took about 14 minutes for 20 epochs on 3,000 charts.
+  CLAIMS TO AVOID
+   - "The deep-learning pipeline is more accurate than the classical one" (they tie on all measured sets).
+   - "Works on any flowchart" or on handwritten/real photos (not tested).
+   - "100 % accurate" (the saturated validation score is a ceiling effect on easy synthetic data; edge
+     recovery was 0.706 on the harder test set).
+   - Describing the generator as the original one (it was reconstructed - see 6.4).
+
+
+=====================================================================================================
+14. FUTURE WORK  (in rough order of value)
+=====================================================================================================
+  1. Edges that bend (elbow / orthogonal connectors): trace by skeleton and corner detection; store
+     waypoints in the draw.io edge.
+  2. Fix the "touches != 2 shapes" rule: split merged line components at junctions so crossings and
+     shared line segments do not discard edges (the biggest measured accuracy loss).
+  3. More shape classes (oval/terminator, parallelogram, document): extend the generator, add classes,
+     retrain - the network side needs no code change.
+  4. Edge labels ("Yes"/"No"): OCR text near edge midpoints and attach it to the nearest edge.
+  5. A harder, more varied generator (diagonal edges, different fonts, line widths, tools' styles, noise,
+     blur, compression) so the validation set stops saturating, then compare models properly.
+  6. Real-image test set (a few dozen flowcharts from other tools) with hand-made ground truth.
+  7. Replace Tesseract by a deep-learning OCR (EasyOCR / PaddleOCR) for robustness to degradation.
+  8. A learned arrow-direction classifier on cropped line ends.
+  9. In-page result preview in the web app.
+
+
+=====================================================================================================
+APPENDIX A. GPU TRAINING LOG SUMMARY  [USER LOG]   (YOLOv8n, 3000 train / 300 val, 640 px, batch 16)
+=====================================================================================================
+  epoch  box_loss  cls_loss  mAP50-95 (val)
+    1    0.3632    0.5545    0.979
+    2    0.2683    0.2484    0.983
+    3    0.2515    0.2346    0.985
+    5    0.2207    0.1910    0.991
+    7    0.1958    0.1766    0.995
+   10    0.1660    0.1469    0.995
+   11    0.1489    0.1304    0.995     (mosaic augmentation switched off from here)
+   15    0.1278    0.1090    0.995
+   20    0.09837   0.08157   0.995
+  Precision 1.00 and recall 1.00 and mAP50 0.995 at every epoch. dfl_loss stayed near 0.77-0.81.
+  Per epoch: about 37-46 s training + 2-11 s validation.  Total 0.231 h.
+  A harmless warning about MLflow tracking appeared; it does not affect training.
+
+=====================================================================================================
+APPENDIX B. CPU TRAINING LOG SUMMARY  [VERIFIED from runs/shape_detector/results.csv]
+=====================================================================================================
+  (YOLOv8n, 299 train charts, 100 val charts, 512 px, batch 8, CPU)
+  epoch  box_loss  cls_loss  precision  recall  mAP50  mAP50-95
+    1    0.665     1.276     0.995      0.950   0.986  0.849
+    2    0.464     0.483     1.000      1.000   0.995  0.873
+    3    0.441     0.437     1.000      1.000   0.995  0.891
+    4    0.400     0.414     1.000      1.000   0.995  0.944
+    5    0.337     0.370     1.000      1.000   0.995  0.958
+    6    0.299     0.331     1.000      1.000   0.995  0.980
+    7    0.280     0.301     1.000      1.000   0.995  0.972
+    8    0.254     0.277     1.000      1.000   0.995  0.988
+  8 epochs in 0.224 h (about 13.4 minutes).
+
+=====================================================================================================
+APPENDIX C. FILE INVENTORY
+=====================================================================================================
+  flow2drawio.py       Core converter (all pipeline stages, both detectors, draw.io writer, CLI).
+  app.py               Flask web app "FlowCraft" (user-redesigned UI; conversion logic unchanged).
+  gen_data.py          Synthetic data generator (reconstructed after the original was overwritten).
+  train.py             YOLO training script (user's updated version: main() guard, amp=False, GPU print,
+                       best.pt check, backs up the previous model to models/shape_detector.prev.pt).
+  eval_pipeline.py     Compares classical vs deep learning on ground-truth charts; optional degradation.
+  test_ground_truth.py Regression test on the two demo images, both modes.
+  test_modes.py        Spy/sabotage test proving the modes (section 9.5).
+  requirements.txt     Python dependencies.   README.md  Short user documentation.
+  models/shape_detector.pt        The deployed model (and .prev.pt = the one it replaced).
+  data/, data2/        Datasets (images/, labels/ YOLO txt, gt/ JSON, data.yaml).
+  runs/shape_detector/ Training outputs (weights, results.csv).
+  flowchart.png, flowchart2.png   The two demonstration images.  demo_*.drawio  Their converted output.
+
+=====================================================================================================
+APPENDIX D. GLOSSARY
+=====================================================================================================
+  Node / shape      a box or diamond in the flowchart.       Edge     a connection (line/arrow) between two nodes.
+  YOLO              "You Only Look Once", a family of fast neural-network object detectors; v8n = nano size.
+  mAP50 / mAP50-95  detection quality: average precision at IoU 0.5 / averaged over IoU 0.5-0.95.
+  IoU               intersection over union of two boxes (overlap measure).
+  NMS               non-maximum suppression: removes duplicate overlapping detections.
+  Otsu threshold    automatic choice of the black/white cut-off from the image histogram.
+  Contour / hole    outline of a connected region; a "hole" is a white region enclosed by ink.
+  Distance transform for each ink pixel, the distance to the nearest background pixel (about half the line
+                    thickness); used to spot the thicker arrowhead.
+  OCR               optical character recognition (here Tesseract).
+  .drawio           XML diagram file format of the draw.io / diagrams.net editor.
+  Fallback          the classical detector used when the neural network cannot be used.
+  Synthetic data    images generated by a program, with exact labels, instead of collected and hand-labelled.
+  Ceiling effect    a score that cannot go higher, so it stops distinguishing good from better models.
+=====================================================================================================
+END OF DOCUMENT
+=====================================================================================================
